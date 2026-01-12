@@ -86,7 +86,7 @@ def _create_graphiti_client(settings: ZepEnvDep) -> ZepGraphiti:
     """Create a Graphiti client based on the configured database provider."""
     # Ensure we have a provider, defaulting to falkordb
     provider = (settings.database_provider or 'falkordb').lower().strip()
-    
+
     if provider == 'falkordb':
         falkor_driver = FalkorDriver(
             host=settings.falkordb_host,
@@ -113,7 +113,7 @@ def _create_graphiti_client(settings: ZepEnvDep) -> ZepGraphiti:
 async def get_graphiti(settings: ZepEnvDep):
     client = _create_graphiti_client(settings)
     api_key = settings.openai_api_key.strip() if settings.openai_api_key else None
-    
+
     if settings.openai_base_url is not None:
         client.llm_client.config.base_url = settings.openai_base_url
     if api_key:
@@ -146,12 +146,13 @@ async def get_fact_result_from_edge(edge: EntityEdge, graphiti: ZepGraphiti):
     Convert EntityEdge to FactResult, including source episode information.
     Extracts meeting metadata from episode source_description.
     """
-    from graph_service.dto import SourceEpisode
-    import re
     import json
-    
+    import re
+
+    from graph_service.dto import SourceEpisode
+
     source_episodes = []
-    
+
     # Fetch episodes if they exist
     if edge.episodes and len(edge.episodes) > 0:
         try:
@@ -159,31 +160,39 @@ async def get_fact_result_from_edge(edge: EntityEdge, graphiti: ZepGraphiti):
             for episode in episodes:
                 # Extract metadata from source_description
                 # Format: "Meeting: {title} | METADATA: {\"meeting_id\":\"...\",...}"
-                metadata_match = re.search(r'METADATA:\s*({.*?})(?:\s*$|\s*\|)', episode.source_description or '')
+                metadata_match = re.search(
+                    r'METADATA:\s*({.*?})(?:\s*$|\s*\|)', episode.source_description or ''
+                )
                 meeting_id = None
                 meeting_type_id = None
                 owner_id = None
-                
+                transcript_start_time = None
+
                 if metadata_match:
                     try:
                         metadata = json.loads(metadata_match.group(1))
                         meeting_id = metadata.get('meeting_id')
                         meeting_type_id = metadata.get('meeting_type_id')
                         owner_id = metadata.get('owner_id')
+                        # Extract transcript_start_time from metadata
+                        transcript_start_time = metadata.get('transcript_start_time')
                     except (json.JSONDecodeError, AttributeError):
                         pass
-                
-                source_episodes.append(SourceEpisode(
-                    uuid=episode.uuid,
-                    name=episode.name,
-                    meeting_id=meeting_id,
-                    meeting_type_id=meeting_type_id,
-                    owner_id=owner_id,
-                    valid_at=episode.valid_at,
-                ))
+
+                source_episodes.append(
+                    SourceEpisode(
+                        uuid=episode.uuid,
+                        name=episode.name,
+                        meeting_id=meeting_id,
+                        meeting_type_id=meeting_type_id,
+                        owner_id=owner_id,
+                        valid_at=episode.valid_at,
+                        timestamp=transcript_start_time,
+                    )
+                )
         except Exception as ex:
-            logger.warning(f"Error fetching source episodes for edge {edge.uuid}: {ex}")
-    
+            logger.warning(f'Error fetching source episodes for edge {edge.uuid}: {ex}')
+
     return FactResult(
         uuid=edge.uuid,
         name=edge.name,
@@ -206,14 +215,17 @@ def get_graphiti_for_group(group_id: str, base_graphiti: ZepGraphiti) -> ZepGrap
     For other providers, returns the base client.
     """
     import logging
+
     from graphiti_core.driver.driver import GraphProvider
-    
+
     logger = logging.getLogger(__name__)
-    
+
     if base_graphiti.driver.provider == GraphProvider.FALKORDB:
         # Clone the driver with the group_id as the database name
         cloned_driver = base_graphiti.driver.clone(database=group_id)
-        logger.debug(f"Created driver clone for group_id={group_id}, database={getattr(cloned_driver, '_database', 'unknown')}")
+        logger.debug(
+            f'Created driver clone for group_id={group_id}, database={getattr(cloned_driver, "_database", "unknown")}'
+        )
         # Create a new ZepGraphiti instance with the cloned driver
         client = ZepGraphiti(graph_driver=cloned_driver, llm_client=base_graphiti.llm_client)
         # Copy embedder reference (needed for entity node operations)

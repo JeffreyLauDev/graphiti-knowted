@@ -18,18 +18,23 @@ class SearchQuery(BaseModel):
         None, description='Optional: Filter results to specific meeting type IDs'
     )
     user_ids: list[str] | None = Field(
-        None, description='Optional: Filter results to meetings where user is owner or has direct access'
+        None,
+        description='Optional: Filter results to meetings where user is owner or has direct access',
     )
 
 
 class SourceEpisode(BaseModel):
     """Source episode information extracted from metadata"""
+
     uuid: str
     name: str
     meeting_id: str | None = None
     meeting_type_id: str | None = None
     owner_id: str | None = None
     valid_at: datetime | None = None
+    timestamp: str | None = Field(
+        None, description='Timestamp from the meeting transcript (MM:SS or HH:MM:SS format)'
+    )
 
     class Config:
         json_encoders = {datetime: lambda v: v.astimezone(timezone.utc).isoformat()}
@@ -45,7 +50,7 @@ class FactResult(BaseModel):
     expired_at: datetime | None
     source_episodes: list[SourceEpisode] = Field(
         default_factory=list,
-        description='List of source episodes where this fact was extracted from, including meeting metadata'
+        description='List of source episodes where this fact was extracted from, including meeting metadata',
     )
 
     class Config:
