@@ -5,11 +5,17 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, status
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.models.edges.edge_db_queries import (
+    get_entity_edge_from_record,
+    get_entity_edge_return_query,
+)
 from graphiti_core.models.nodes.node_db_queries import (
     EPISODIC_NODE_RETURN,
     EPISODIC_NODE_RETURN_NEPTUNE,
+    get_episodic_node_from_record,
 )
-from graphiti_core.nodes import EpisodicNode, get_episodic_node_from_record
+from graphiti_core.nodes import EpisodicNode
+from graphiti_core.search.search_utils import calculate_cosine_similarity
 
 from graph_service.dto import (
     GetMemoryRequest,
@@ -37,76 +43,82 @@ def build_metadata_filter_conditions(
     """
     Build database filter conditions for meeting_ids, meeting_type_ids, and user_ids.
     These are stored as JSON in source_description, so we use string matching.
-
+    
     For user_ids: matches if user is owner_id OR in direct_access_user_ids array.
-
+    
     Returns list of filter condition strings that can be joined with OR.
     """
     filter_conditions = []
-
+    
     if meeting_ids:
         for meeting_id in meeting_ids:
             # Escape quotes for SQL safety
             escaped_id = meeting_id.replace("'", "''")
             # Match JSON pattern: "meeting_id":"{meeting_id}"
             filter_conditions.append(
-                f'e.source_description CONTAINS \'"meeting_id":"{escaped_id}"\''
+                f"e.source_description CONTAINS '\"meeting_id\":\"{escaped_id}\"'"
             )
-
+    
     if meeting_type_ids:
         for meeting_type_id in meeting_type_ids:
             # Escape quotes for SQL safety
             escaped_id = meeting_type_id.replace("'", "''")
             # Match JSON pattern: "meeting_type_id":"{meeting_type_id}"
             filter_conditions.append(
-                f'e.source_description CONTAINS \'"meeting_type_id":"{escaped_id}"\''
+                f"e.source_description CONTAINS '\"meeting_type_id\":\"{escaped_id}\"'"
             )
-
+    
     if user_ids:
         for user_id in user_ids:
             # Escape quotes for SQL safety
             escaped_id = user_id.replace("'", "''")
             # Match if user is owner: "owner_id":"{user_id}"
-            filter_conditions.append(f'e.source_description CONTAINS \'"owner_id":"{escaped_id}"\'')
+            filter_conditions.append(
+                f"e.source_description CONTAINS '\"owner_id\":\"{escaped_id}\"'"
+            )
             # Match if user is in direct_access_user_ids array
             # JSON format: "direct_access_user_ids":["user1","user2","user3"]
             # Check for user_id at start of array: ["user_id"
             filter_conditions.append(
-                f'e.source_description CONTAINS \'"direct_access_user_ids":["{escaped_id}"\''
+                f"e.source_description CONTAINS '\"direct_access_user_ids\":[\"{escaped_id}\"'"
             )
             # Check for user_id in middle: ,"user_id"
-            filter_conditions.append(f'e.source_description CONTAINS \',"{escaped_id}"\'')
+            filter_conditions.append(
+                f"e.source_description CONTAINS ',\"{escaped_id}\"'"
+            )
             # Check for user_id at end: "user_id"]
-            filter_conditions.append(f'e.source_description CONTAINS \'"{escaped_id}"]\'')
-
+            filter_conditions.append(
+                f"e.source_description CONTAINS '\"{escaped_id}\"]'"
+            )
+    
     return filter_conditions
 
 
 def build_episode_uuid_filter_conditions(
     episode_uuids: list[str],
     provider: GraphProvider,
-    property_name: str = 'e.episodes',
+    property_name: str = "e.episodes",
 ) -> list[str]:
     """
     Build database filter conditions for episode UUIDs in edges.
     Episodes are stored as comma-separated string: "uuid1,uuid2,uuid3"
-
+    
     Returns list of filter condition strings that can be joined with OR.
     """
     filter_conditions = []
-
+    
     # Limit to avoid query size issues
     for ep_uuid in episode_uuids[:100]:
         # Escape quotes for SQL safety
         escaped_uuid = ep_uuid.replace("'", "''")
-
+        
         if provider == GraphProvider.FALKORDB:
             # FalkorDB: use CONTAINS for string matching
             filter_conditions.append(f"{property_name} CONTAINS '{escaped_uuid}'")
         else:
             # Neo4j/Kuzu: check if episode UUID is in the episodes string/array
             filter_conditions.append(f"'{escaped_uuid}' IN split({property_name}, ',')")
-
+    
     return filter_conditions
 
 
@@ -116,9 +128,10 @@ def extract_episode_metadata(episode: EpisodicNode) -> dict[str, str | None | li
     Returns dict with meeting_id, meeting_type_id, owner_id, and direct_access_user_ids.
     """
     metadata_match = re.search(
-        r'METADATA:\s*({.*?})(?:\s*$|\s*\|)', episode.source_description or ''
+        r'METADATA:\s*({.*?})(?:\s*$|\s*\|)', 
+        episode.source_description or ''
     )
-
+    
     if not metadata_match:
         return {
             'meeting_id': None,
@@ -126,14 +139,14 @@ def extract_episode_metadata(episode: EpisodicNode) -> dict[str, str | None | li
             'owner_id': None,
             'direct_access_user_ids': [],
         }
-
+    
     try:
         metadata = json.loads(metadata_match.group(1))
         direct_access = metadata.get('direct_access_user_ids', [])
         # Ensure it's a list
         if not isinstance(direct_access, list):
             direct_access = []
-
+        
         return {
             'meeting_id': metadata.get('meeting_id'),
             'meeting_type_id': metadata.get('meeting_type_id'),
@@ -151,13 +164,14 @@ def extract_episode_metadata(episode: EpisodicNode) -> dict[str, str | None | li
 
 @router.post('/search', status_code=status.HTTP_200_OK)
 async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
+
     logger.info(
         f"Search request received - query: '{query.query}', group_ids: {query.group_ids}, max_facts: {query.max_facts}, meeting_ids: {query.meeting_ids}, meeting_type_ids: {query.meeting_type_ids}, user_ids: {query.user_ids}"
     )
 
     # Filter episodes by meeting_ids and/or meeting_type_ids if provided
     filtered_episode_uuids = None
-
+    
     # For multi-tenant FalkorDB, we need to search each organization's graph separately
     # For now, if multiple group_ids are provided, we'll search the first one
     # TODO: Support searching across multiple organizations by combining results
@@ -170,8 +184,10 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
         )
 
         # Filter episodes by meeting_ids, meeting_type_ids, and/or user_ids if provided
-        # OPTIMIZED: Filter at database level before expensive search
-        filtered_episode_uuids = None
+        # OPTIMIZED: Filter at database level using string matching before fetching
+        # This happens BEFORE the expensive graph/vector search to save operations
+        # Note: meeting_id/meeting_type_id/owner_id/direct_access_user_ids are stored in JSON within source_description,
+        # so we can't filter them the same way as group_id (which is a direct property)
         if query.meeting_ids or query.meeting_type_ids or query.user_ids:
             try:
                 # Build filter conditions using DRY helper function
@@ -181,11 +197,13 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
                     query.user_ids,
                     org_graphiti.driver.provider,
                 )
-
+                
                 # Query episodes with filters applied at database level
                 if episode_filter_conditions:
+                    # Use OR logic for database pre-filtering (approximate match)
+                    # Exact AND logic is enforced in Python-level filtering below
                     filter_clause = ' OR '.join(episode_filter_conditions)
-
+                    
                     records, _, _ = await org_graphiti.driver.execute_query(
                         f"""
                         MATCH (e:Episodic)
@@ -204,23 +222,27 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
                         group_ids=query.group_ids,
                         routing_='r',
                     )
-
+                    
                     matching_episodes = [
                         get_episodic_node_from_record(record) for record in records
                     ]
-
-                    # Filter in Python to ensure exact matches (database filter is approximate)
+                    
+                    # Now filter in Python to ensure exact matches (database filter is approximate)
+                    # This is necessary because meeting_id/meeting_type_id/owner_id/direct_access_user_ids are in JSON, not direct properties
                     filtered_episode_uuids = []
                     for episode in matching_episodes:
                         metadata = extract_episode_metadata(episode)
-
+                        
+                        # Check exact matches
                         matches_meeting_id = (
-                            not query.meeting_ids or metadata['meeting_id'] in query.meeting_ids
+                            not query.meeting_ids or 
+                            metadata['meeting_id'] in query.meeting_ids
                         )
                         matches_meeting_type_id = (
-                            not query.meeting_type_ids
-                            or metadata['meeting_type_id'] in query.meeting_type_ids
+                            not query.meeting_type_ids or 
+                            metadata['meeting_type_id'] in query.meeting_type_ids
                         )
+                        # Check if user is owner OR in direct_access_user_ids
                         matches_user_id = True
                         if query.user_ids:
                             user_id_set = set(query.user_ids)
@@ -230,39 +252,161 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
                                 for user_id in metadata.get('direct_access_user_ids', [])
                             )
                             matches_user_id = is_owner or has_direct_access
-
+                        
                         if matches_meeting_id and matches_meeting_type_id and matches_user_id:
                             filtered_episode_uuids.append(episode.uuid)
-
-                    if not filtered_episode_uuids:
-                        # Return early if no matching episodes - saves expensive search
+                    
+                    if filtered_episode_uuids:
+                        logger.info(
+                            f'Filtered to {len(filtered_episode_uuids)} episodes matching meeting_ids={query.meeting_ids}, meeting_type_ids={query.meeting_type_ids}, user_ids={query.user_ids} (from {len(matching_episodes)} database matches)'
+                        )
+                    else:
+                        logger.warning(
+                            f'No episodes found matching meeting_ids={query.meeting_ids}, meeting_type_ids={query.meeting_type_ids}, user_ids={query.user_ids}'
+                        )
+                        # Return empty results if no matching episodes - saves expensive search operations
                         return SearchResults(facts=[])
+                else:
+                    # No filters provided, skip filtering
+                    filtered_episode_uuids = None
             except Exception as ex:
-                logger.warning(f'Error filtering episodes: {ex}', exc_info=True)
+                logger.warning(
+                    f'Error filtering episodes by meeting_ids/meeting_type_ids: {ex}', 
+                    exc_info=True
+                )
                 # Continue with search if filtering fails
                 filtered_episode_uuids = None
 
-        # Use Graphiti's built-in search (with RRF by default)
-        relevant_edges = await org_graphiti.search(
-            group_ids=query.group_ids,
-            query=query.query,
-            num_results=query.max_facts * 2 if filtered_episode_uuids else query.max_facts,
-        )
+        # Debug code removed for performance optimization
 
-        # Post-filter: Only keep edges that reference our filtered episodes
+        # If we have filtered episode UUIDs, we need to constrain the search
+        # OPTIMIZED: Filter edges at database level by episode UUIDs to avoid expensive operations
         if filtered_episode_uuids:
-            episode_uuid_set = set(filtered_episode_uuids)
-            filtered_edges = []
-            for edge in relevant_edges:
-                if edge.episodes:
-                    edge_episodes = (
-                        edge.episodes
-                        if isinstance(edge.episodes, list)
-                        else str(edge.episodes).split(',')
+            # Query edges directly from database that reference our filtered episodes
+            # This is much faster than searching the entire graph
+            try:
+                episode_uuid_set = set(filtered_episode_uuids)
+                
+                # Build query to get edges that reference our episodes
+                # OPTIMIZED: Filter by episode UUIDs in database query
+                match_query = """
+                    MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                """
+                if org_graphiti.driver.provider == GraphProvider.KUZU:
+                    match_query = """
+                        MATCH (n:Entity)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(m:Entity)
+                    """
+                
+                # Build filter conditions using DRY helper function
+                episode_filter_conditions = build_episode_uuid_filter_conditions(
+                    filtered_episode_uuids,
+                    org_graphiti.driver.provider,
+                    property_name="e.episodes",
+                )
+                
+                if episode_filter_conditions:
+                    episode_filter = ' OR '.join(episode_filter_conditions)
+                    
+                    # Query edges filtered by episode UUIDs at database level
+                    records, _, _ = await org_graphiti.driver.execute_query(
+                        match_query
+                        + f"""
+                        WHERE e.group_id IN $group_ids
+                        AND ({episode_filter})
+                        RETURN
+                        """
+                        + get_entity_edge_return_query(org_graphiti.driver.provider)
+                        + """
+                        LIMIT $limit
+                        """,
+                        group_ids=query.group_ids,
+                        limit=query.max_facts * 20,  # Get enough candidates for semantic search
+                        routing_='r',
                     )
-                    if any(ep.strip() in episode_uuid_set for ep in edge_episodes):
-                        filtered_edges.append(edge)
-            relevant_edges = filtered_edges[: query.max_facts]
+                    
+                    candidate_edges = [
+                        get_entity_edge_from_record(record, org_graphiti.driver.provider) 
+                        for record in records
+                    ]
+                    
+                    # Additional Python-level filtering to ensure exact matches
+                    # (database filter might match partial UUIDs)
+                    filtered_candidate_edges = []
+                    for edge in candidate_edges:
+                        if edge.episodes:
+                            edge_episodes = edge.episodes if isinstance(edge.episodes, list) else str(edge.episodes).split(',')
+                            if any(ep.strip() in episode_uuid_set for ep in edge_episodes):
+                                filtered_candidate_edges.append(edge)
+                    candidate_edges = filtered_candidate_edges
+                else:
+                    # Fallback if too many episode UUIDs (shouldn't happen with limit)
+                    candidate_edges = []
+                
+                logger.info(
+                    f'Found {len(candidate_edges)} candidate edges from {len(filtered_episode_uuids)} filtered episodes (database-filtered)'
+                )
+                
+                if not candidate_edges:
+                    return SearchResults(facts=[])
+                
+                # Now do semantic search ONLY on these filtered candidate edges
+                # Get query embedding
+                query_vector = await org_graphiti.embedder.embed(query.query)
+                
+                # Calculate similarity scores for candidate edges
+                scored_edges = []
+                for edge in candidate_edges:
+                    try:
+                        # Load embedding if needed
+                        if not hasattr(edge, 'fact_embedding') or not edge.fact_embedding:
+                            # Edge might need embedding loaded
+                            continue
+                        
+                        edge_embedding = edge.fact_embedding
+                        if isinstance(edge_embedding, str):
+                            edge_embedding = [float(x.strip()) for x in edge_embedding.split(',')]
+                        
+                        if len(edge_embedding) == len(query_vector):
+                            score = calculate_cosine_similarity(query_vector, edge_embedding)
+                            if score > 0.3:  # Minimum similarity threshold
+                                scored_edges.append((edge, score))
+                    except Exception as ex:
+                        logger.debug(f'Error calculating similarity for edge {edge.uuid}: {ex}')
+                        continue
+                
+                # Sort by score and take top results
+                scored_edges.sort(key=lambda x: x[1], reverse=True)
+                relevant_edges = [edge for edge, _ in scored_edges[:query.max_facts]]
+                
+                logger.info(
+                    f'Semantic search on filtered edges returned {len(relevant_edges)} relevant edges (from {len(candidate_edges)} candidates)'
+                )
+            except Exception as ex:
+                logger.error(
+                    f'Error doing optimized search with episode filtering: {ex}', 
+                    exc_info=True
+                )
+                # Fallback: regular search then filter (less efficient but works)
+                relevant_edges = await org_graphiti.search(
+                    group_ids=query.group_ids,
+                    query=query.query,
+                    num_results=query.max_facts * 2,
+                )
+                episode_uuid_set = set(filtered_episode_uuids)
+                filtered_edges = []
+                for edge in relevant_edges:
+                    if edge.episodes:
+                        edge_episodes = edge.episodes if isinstance(edge.episodes, list) else str(edge.episodes).split(',')
+                        if any(ep.strip() in episode_uuid_set for ep in edge_episodes):
+                            filtered_edges.append(edge)
+                relevant_edges = filtered_edges[:query.max_facts]
+        else:
+            # No filtering needed, do regular search
+            relevant_edges = await org_graphiti.search(
+                group_ids=query.group_ids,
+                query=query.query,
+                num_results=query.max_facts,
+            )
     else:
         # No group_ids specified, use base client
         # Note: Filtering by meeting_ids/meeting_type_ids/user_ids requires group_ids
@@ -314,6 +458,7 @@ async def get_entity_edge(uuid: str, graphiti: ZepGraphitiDep):
 
 @router.get('/episodes/{group_id}', status_code=status.HTTP_200_OK)
 async def get_episodes(group_id: str, last_n: int, graphiti: ZepGraphitiDep):
+
     logger.info(f'Get episodes request - group_id: {group_id}, last_n: {last_n}')
 
     # Get organization-specific Graphiti client (uses group_id as database name for FalkorDB)
@@ -346,6 +491,7 @@ async def get_memory(
 
 @router.get('/debug/episodes-all', status_code=status.HTTP_200_OK)
 async def debug_episodes_all(graphiti: ZepGraphitiDep):
+
     try:
         # Query all node types to see what's in the database
 
