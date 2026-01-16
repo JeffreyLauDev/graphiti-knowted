@@ -77,12 +77,9 @@ ENV PYTHONUNBUFFERED=1 \
 # Switch to non-root user
 USER app
 
-# Expose port (default 8000, can be overridden by PORT env var at runtime)
-# EXPOSE is just documentation - actual port is controlled by PORT env var
-EXPOSE 8000
+# Set port
+ENV PORT=8000
+EXPOSE $PORT
 
 # Use the venv Python directly to avoid uv run reinstalling from lockfile
-# Use shell form to allow PORT environment variable expansion
-# PORT env var can be set by orchestrator (Digital Ocean, Kubernetes, etc.)
-# Defaults to 8000 if not set (for local development)
-CMD .venv/bin/python -m uvicorn graph_service.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD [".venv/bin/python", "-m", "uvicorn", "graph_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
