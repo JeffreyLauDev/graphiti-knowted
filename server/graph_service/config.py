@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     # FalkorDB settings (used when database_provider='falkordb')
     falkordb_host: str = Field(default='localhost')
     falkordb_port: int = Field(default=6380)
+    falkordb_username: str | None = Field(None)
     falkordb_password: str | None = Field(None)
     falkordb_database: str = Field(default='default_db')
 

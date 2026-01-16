@@ -65,6 +65,7 @@ services:
       - DATABASE_PROVIDER=falkordb
       - FALKORDB_HOST=falkordb
       - FALKORDB_PORT=6379
+      - FALKORDB_USERNAME=${FALKORDB_USERNAME:-}
       - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
       - FALKORDB_DATABASE=${FALKORDB_DATABASE:-default_db}
     ports:
