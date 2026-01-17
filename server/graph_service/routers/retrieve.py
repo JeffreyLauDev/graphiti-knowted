@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, status
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.edges import get_entity_edge_from_record
 from graphiti_core.models.edges.edge_db_queries import (
-    get_entity_edge_from_record,
     get_entity_edge_return_query,
 )
 from graphiti_core.models.nodes.node_db_queries import (
