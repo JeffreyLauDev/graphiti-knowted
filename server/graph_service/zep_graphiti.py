@@ -164,6 +164,7 @@ async def get_fact_result_from_edge(edge: EntityEdge, graphiti: ZepGraphiti):
                 meeting_id = None
                 meeting_type_id = None
                 owner_id = None
+                transcript_start_time = None
                 
                 if metadata_match:
                     try:
@@ -171,6 +172,7 @@ async def get_fact_result_from_edge(edge: EntityEdge, graphiti: ZepGraphiti):
                         meeting_id = metadata.get('meeting_id')
                         meeting_type_id = metadata.get('meeting_type_id')
                         owner_id = metadata.get('owner_id')
+                        transcript_start_time = metadata.get('transcript_start_time')
                     except (json.JSONDecodeError, AttributeError):
                         pass
                 
@@ -181,6 +183,7 @@ async def get_fact_result_from_edge(edge: EntityEdge, graphiti: ZepGraphiti):
                     meeting_type_id=meeting_type_id,
                     owner_id=owner_id,
                     valid_at=episode.valid_at,
+                    timestamp=transcript_start_time,
                 ))
         except Exception as ex:
             logger.warning(f"Error fetching source episodes for edge {edge.uuid}: {ex}")

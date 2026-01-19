@@ -30,6 +30,9 @@ class SourceEpisode(BaseModel):
     meeting_type_id: str | None = None
     owner_id: str | None = None
     valid_at: datetime | None = None
+    timestamp: str | None = Field(
+        None, description='Timestamp from the meeting transcript (MM:SS or HH:MM:SS format)'
+    )
 
     class Config:
         json_encoders = {datetime: lambda v: v.astimezone(timezone.utc).isoformat()}
