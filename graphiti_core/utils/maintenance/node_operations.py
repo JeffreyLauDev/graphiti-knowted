@@ -21,6 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from graphiti_core.edges import EntityEdge
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import semaphore_gather
 from graphiti_core.llm_client import LLMClient
@@ -37,7 +38,6 @@ from graphiti_core.prompts.extract_nodes import (
     EntitySummary,
     ExtractedEntities,
     ExtractedEntity,
-    MissedEntities,
 )
 from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
@@ -56,39 +56,11 @@ from graphiti_core.utils.maintenance.dedup_helpers import (
     _build_candidate_indexes,
     _resolve_with_similarity,
 )
-from graphiti_core.utils.maintenance.edge_operations import (
-    filter_existing_duplicate_of_edges,
-)
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS, truncate_at_sentence
 
 logger = logging.getLogger(__name__)
 
 NodeSummaryFilter = Callable[[EntityNode], Awaitable[bool]]
-
-
-async def extract_nodes_reflexion(
-    llm_client: LLMClient,
-    episode: EpisodicNode,
-    previous_episodes: list[EpisodicNode],
-    node_names: list[str],
-    group_id: str | None = None,
-) -> list[str]:
-    # Prepare context for LLM
-    context = {
-        'episode_content': episode.content,
-        'previous_episodes': [ep.content for ep in previous_episodes],
-        'extracted_entities': node_names,
-    }
-
-    llm_response = await llm_client.generate_response(
-        prompt_library.extract_nodes.reflexion(context),
-        MissedEntities,
-        group_id=group_id,
-        prompt_name='extract_nodes.reflexion',
-    )
-    missed_entities = llm_response.get('missed_entities', [])
-
-    return missed_entities
 
 
 async def extract_nodes(
@@ -399,14 +371,18 @@ async def _resolve_with_llm(
     existing_nodes_context = [
         {
             **{
-                'idx': i,
                 'name': candidate.name,
                 'entity_types': candidate.labels,
             },
             **candidate.attributes,
         }
-        for i, candidate in enumerate(indexes.existing_nodes)
+        for candidate in indexes.existing_nodes
     ]
+
+    # Build name -> node mapping for resolving duplicates by name
+    existing_nodes_by_name: dict[str, EntityNode] = {
+        node.name: node for node in indexes.existing_nodes
+    }
 
     context = {
         'extracted_nodes': extracted_nodes_context,
@@ -452,7 +428,7 @@ async def _resolve_with_llm(
 
     for resolution in node_resolutions:
         relative_id: int = resolution.id
-        duplicate_idx: int = resolution.duplicate_idx
+        duplicate_name: str = resolution.duplicate_name
 
         if relative_id not in valid_relative_range:
             logger.warning(
@@ -472,14 +448,14 @@ async def _resolve_with_llm(
         extracted_node = extracted_nodes[original_index]
 
         resolved_node: EntityNode
-        if duplicate_idx == -1:
+        if not duplicate_name:
             resolved_node = extracted_node
-        elif 0 <= duplicate_idx < len(indexes.existing_nodes):
-            resolved_node = indexes.existing_nodes[duplicate_idx]
+        elif duplicate_name in existing_nodes_by_name:
+            resolved_node = existing_nodes_by_name[duplicate_name]
         else:
             logger.warning(
-                'Invalid duplicate_idx %s for extracted node %s; treating as no duplicate.',
-                duplicate_idx,
+                'Invalid duplicate_name %r for extracted node %s; treating as no duplicate.',
+                duplicate_name,
                 extracted_node.uuid,
             )
             resolved_node = extracted_node
@@ -500,7 +476,6 @@ async def resolve_extracted_nodes(
 ) -> tuple[list[EntityNode], dict[str, str], list[tuple[EntityNode, EntityNode]]]:
     """Search for existing nodes, resolve deterministic matches, then escalate holdouts to the LLM dedupe prompt."""
     llm_client = clients.llm_client
-    driver = clients.driver
     existing_nodes = await _collect_candidate_nodes(
         clients,
         extracted_nodes,
@@ -537,15 +512,26 @@ async def resolve_extracted_nodes(
         [(node.name, node.uuid) for node in state.resolved_nodes if node is not None],
     )
 
-    new_node_duplicates: list[
-        tuple[EntityNode, EntityNode]
-    ] = await filter_existing_duplicate_of_edges(driver, state.duplicate_pairs)
-
     return (
         [node for node in state.resolved_nodes if node is not None],
         state.uuid_map,
-        new_node_duplicates,
+        state.duplicate_pairs,
     )
+
+
+def _build_edges_by_node(edges: list[EntityEdge] | None) -> dict[str, list[EntityEdge]]:
+    """Build a dictionary mapping node UUIDs to their connected edges."""
+    edges_by_node: dict[str, list[EntityEdge]] = {}
+    if not edges:
+        return edges_by_node
+    for edge in edges:
+        if edge.source_node_uuid not in edges_by_node:
+            edges_by_node[edge.source_node_uuid] = []
+        if edge.target_node_uuid not in edges_by_node:
+            edges_by_node[edge.target_node_uuid] = []
+        edges_by_node[edge.source_node_uuid].append(edge)
+        edges_by_node[edge.target_node_uuid].append(edge)
+    return edges_by_node
 
 
 async def extract_attributes_from_nodes(
@@ -555,9 +541,14 @@ async def extract_attributes_from_nodes(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_types: dict[str, type[BaseModel]] | None = None,
     should_summarize_node: NodeSummaryFilter | None = None,
+    edges: list[EntityEdge] | None = None,
 ) -> list[EntityNode]:
     llm_client = clients.llm_client
     embedder = clients.embedder
+
+    # Pre-build edges lookup for O(E + N) instead of O(N * E)
+    edges_by_node = _build_edges_by_node(edges)
+
     updated_nodes: list[EntityNode] = await semaphore_gather(
         *[
             extract_attributes_from_node(
@@ -571,6 +562,7 @@ async def extract_attributes_from_nodes(
                     else None
                 ),
                 should_summarize_node,
+                edges_by_node.get(node.uuid, []),
             )
             for node in nodes
         ]
@@ -588,6 +580,7 @@ async def extract_attributes_from_node(
     previous_episodes: list[EpisodicNode] | None = None,
     entity_type: type[BaseModel] | None = None,
     should_summarize_node: NodeSummaryFilter | None = None,
+    edges: list[EntityEdge] | None = None,
 ) -> EntityNode:
     # Extract attributes if entity type is defined and has attributes
     llm_response = await _extract_entity_attributes(
@@ -596,7 +589,7 @@ async def extract_attributes_from_node(
 
     # Extract summary if needed
     await _extract_entity_summary(
-        llm_client, node, episode, previous_episodes, should_summarize_node
+        llm_client, node, episode, previous_episodes, should_summarize_node, edges
     )
 
     node.attributes.update(llm_response)
@@ -645,14 +638,30 @@ async def _extract_entity_summary(
     episode: EpisodicNode | None,
     previous_episodes: list[EpisodicNode] | None,
     should_summarize_node: NodeSummaryFilter | None,
+    edges: list[EntityEdge] | None = None,
 ) -> None:
     if should_summarize_node is not None and not await should_summarize_node(node):
+        return
+
+    # Build summary with edge facts appended
+    summary_with_edges = node.summary
+    if edges:
+        edge_facts = '\n'.join(edge.fact for edge in edges if edge.fact)
+        summary_with_edges = f'{summary_with_edges}\n{edge_facts}'.strip()
+
+    # If we have summary content and it's short enough, use it directly
+    if summary_with_edges and len(summary_with_edges) <= MAX_SUMMARY_CHARS * 4:
+        node.summary = summary_with_edges
+        return
+
+    # Skip if no summary content and no episode to generate from
+    if not summary_with_edges and episode is None:
         return
 
     summary_context = _build_episode_context(
         node_data={
             'name': node.name,
-            'summary': truncate_at_sentence(node.summary, MAX_SUMMARY_CHARS),
+            'summary': node.summary,
             'entity_types': node.labels,
             'attributes': node.attributes,
         },
